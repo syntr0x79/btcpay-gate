@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "not gofmt'd:"; echo "$unformatted"; exit 1; fi
+
+      - run: go vet ./...
+      - run: go vet -tags=regtest ./test/regtest/
+      - run: go test -race ./...
+      - run: go build ./...
+
+  regtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # A real bitcoin-core on a private chain. The reorg test needs a node it
+      # is allowed to rewind, which rules out any shared testnet.
+      - name: Start bitcoind (regtest)
+        run: docker compose up -d --wait
+
+      - name: Integration tests
+        run: go test -tags=regtest -count=1 -v ./test/regtest/
+
+      - name: bitcoind logs on failure
+        if: failure()
+        run: docker compose logs --tail=200

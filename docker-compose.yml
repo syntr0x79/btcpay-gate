@@ -1,0 +1,24 @@
+# bitcoind in regtest for the integration suite.
+#
+# regtest is a private chain where blocks are mined on command, which is what
+# makes a reorg test possible: invalidateblock rewinds the tip deterministically
+# instead of waiting for one to happen on its own.
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:28.0
+    command:
+      - -regtest=1
+      - -server=1
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=paygate
+      - -rpcpassword=paygate
+      - -fallbackfee=0.0002      # regtest has no fee estimation
+      - -txindex=1
+    ports:
+      - "18443:18443"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=paygate", "-rpcpassword=paygate", "getblockchaininfo"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
