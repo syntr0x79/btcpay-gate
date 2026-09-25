@@ -69,17 +69,30 @@ func run(log *slog.Logger) error {
 
 	mon := monitor.New(node, store, cfg.pollInterval, log).WithHealth(hl)
 	sender := newSender(store, cfg, log)
+	apiSrv := api.New(store, w, api.Config{
+		DefaultConfirmations: cfg.requiredConf,
+		DefaultTTL:           cfg.invoiceTTL,
+		Health:               hl,
+	}, log)
 	server := &http.Server{
-		Addr: cfg.listen,
-		Handler: api.New(store, w, api.Config{
-			DefaultConfirmations: cfg.requiredConf,
-			DefaultTTL:           cfg.invoiceTTL,
-			Health:               hl,
-		}, log).Routes(),
+		Addr:              cfg.listen,
+		Handler:           apiSrv.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	errs := make(chan error, 3)
+	// Metrics on their own listener, like the shop's METRICS_LISTEN_ADDR: this
+	// is the only socket published to the monitoring mesh, and it is published
+	// without authentication. The invoice API stays off it.
+	var metricsSrv *http.Server
+	if cfg.metricsListen != "" {
+		metricsSrv = &http.Server{
+			Addr:              cfg.metricsListen,
+			Handler:           apiSrv.MetricsRoutes(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+	}
+
+	errs := make(chan error, 4)
 	go func() { errs <- mon.Run(ctx) }()
 	go func() { errs <- sender.Run(ctx) }()
 	go func() {
@@ -90,26 +103,41 @@ func run(log *slog.Logger) error {
 		}
 		errs <- err
 	}()
+	if metricsSrv != nil {
+		go func() {
+			log.Info("metrics listening", "addr", cfg.metricsListen)
+			err := metricsSrv.ListenAndServe()
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			errs <- err
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
 	case err := <-errs:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			stop()
-			shutdown(server, log)
+			shutdown(server, metricsSrv, log)
 			return err
 		}
 	}
 
-	shutdown(server, log)
+	shutdown(server, metricsSrv, log)
 	return nil
 }
 
-func shutdown(server *http.Server, log *slog.Logger) {
+func shutdown(server, metrics *http.Server, log *slog.Logger) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(ctx); err != nil {
 		log.Error("http shutdown", "err", err)
+	}
+	if metrics != nil {
+		if err := metrics.Shutdown(ctx); err != nil {
+			log.Error("metrics shutdown", "err", err)
+		}
 	}
 	log.Info("stopped")
 }
@@ -122,6 +150,7 @@ type config struct {
 	descriptor    string
 	dbPath        string
 	listen        string
+	metricsListen string
 	webhookURL    string
 	webhookSecret string
 	pollInterval  time.Duration
@@ -133,13 +162,15 @@ type config struct {
 
 func loadConfig() (config, error) {
 	c := config{
-		rpcURL:        env("BITCOIND_RPC_URL", "http://127.0.0.1:18443"),
-		rpcUser:       env("BITCOIND_RPC_USER", ""),
-		rpcPassword:   env("BITCOIND_RPC_PASSWORD", ""),
-		walletName:    env("WALLET_NAME", "payments"),
-		descriptor:    env("WALLET_DESCRIPTOR", ""),
-		dbPath:        env("DB_PATH", "paygate.db"),
-		listen:        env("LISTEN_ADDR", ":8080"),
+		rpcURL:      env("BITCOIND_RPC_URL", "http://127.0.0.1:18443"),
+		rpcUser:     env("BITCOIND_RPC_USER", ""),
+		rpcPassword: env("BITCOIND_RPC_PASSWORD", ""),
+		walletName:  env("WALLET_NAME", "payments"),
+		descriptor:  env("WALLET_DESCRIPTOR", ""),
+		dbPath:      env("DB_PATH", "paygate.db"),
+		listen:      env("LISTEN_ADDR", ":8080"),
+		// Empty by default: a gateway nobody scrapes should not open a port.
+		metricsListen: env("METRICS_LISTEN_ADDR", ""),
 		webhookURL:    env("WEBHOOK_URL", ""),
 		webhookSecret: env("WEBHOOK_SECRET", ""),
 		pollInterval:  duration("POLL_INTERVAL", 10*time.Second),

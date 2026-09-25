@@ -72,6 +72,21 @@ func (s *Server) Routes() *http.ServeMux {
 	mux.HandleFunc("POST /invoices", s.createInvoice)
 	mux.HandleFunc("GET /invoices/{id}", s.getInvoice)
 	mux.HandleFunc("GET /healthz", s.healthz)
+	// Also on the API listener, which nothing publishes: convenient when
+	// debugging from inside the container, and harmless because reaching this
+	// mux at all already means being inside the compose network.
+	mux.HandleFunc("GET /metrics", s.metrics)
+	return mux
+}
+
+// MetricsRoutes is the mux for the dedicated metrics listener.
+//
+// Separate from Routes, and carrying nothing else, because this is the one
+// listener published to the monitoring mesh, and it is published without any
+// authentication — whatever reaches it, reads it. Putting POST /invoices on
+// the same mux would let every machine in the mesh issue invoices.
+func (s *Server) MetricsRoutes() *http.ServeMux {
+	mux := http.NewServeMux()
 	mux.HandleFunc("GET /metrics", s.metrics)
 	return mux
 }

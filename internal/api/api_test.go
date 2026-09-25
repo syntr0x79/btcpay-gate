@@ -304,3 +304,33 @@ func TestMetricsReportZeroForMissingWallet(t *testing.T) {
 		t.Errorf("/metrics does not report a zero poll timestamp:\n%s", body)
 	}
 }
+
+// The metrics listener is published to the monitoring mesh; the API listener
+// is not. Anything reachable on that mux is therefore reachable unauthenticated
+// by everything on the mesh, so it must carry metrics and nothing else —
+// issuing invoices least of all.
+func TestMetricsRoutesServeOnlyMetrics(t *testing.T) {
+	s := healthServer(t, health.Report{OK: true, WalletLoaded: true})
+	mux := s.MetricsRoutes()
+
+	if w := serve(mux, "GET", "/metrics", ""); w.Code != http.StatusOK {
+		t.Fatalf("/metrics on the metrics listener: status %d", w.Code)
+	}
+	for _, path := range []string{"/invoices", "/invoices/abc", "/healthz"} {
+		if w := serve(mux, "POST", path, `{"amount_sat":1000}`); w.Code != http.StatusNotFound {
+			t.Errorf("%s is reachable on the metrics listener: status %d", path, w.Code)
+		}
+	}
+}
+
+func serve(mux *http.ServeMux, method, path, body string) *httptest.ResponseRecorder {
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, path, nil)
+	} else {
+		r = httptest.NewRequest(method, path, strings.NewReader(body))
+	}
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, r)
+	return w
+}
