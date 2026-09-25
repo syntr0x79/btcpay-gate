@@ -152,3 +152,73 @@ func TestIsWalletNotLoaded(t *testing.T) {
 		})
 	}
 }
+
+// Measured against bitcoin core 28.0 on regtest: a freshly imported active
+// descriptor is widened to the wallet's keypool regardless of the range asked
+// for, and every later import must then cover that wider range. ActiveRangeEnd
+// is how the caller finds out what it has to cover.
+func TestActiveRangeEndReadsTheWidestActiveExternalRange(t *testing.T) {
+	c, srv := newRangeNode(t, `{"result":{"wallet_name":"payments","descriptors":[
+		{"desc":"wpkh(tpubA/0/*)#aaa","active":true,"internal":false,"range":[0,999],"next":3},
+		{"desc":"wpkh(tpubA/1/*)#bbb","active":true,"internal":true,"range":[0,4999],"next":0},
+		{"desc":"wpkh(tpubOLD/0/*)#ccc","active":false,"internal":false,"range":[0,9999],"next":0}
+	]}}`)
+	defer srv.Close()
+
+	got, err := c.ActiveRangeEnd(context.Background())
+	if err != nil {
+		t.Fatalf("ActiveRangeEnd: %v", err)
+	}
+	// 999, not 4999 and not 9999: the internal (change) descriptor is not
+	// where invoices are paid, and an inactive one is not watched at all.
+	if got != 999 {
+		t.Errorf("ActiveRangeEnd = %d, want 999", got)
+	}
+}
+
+// A wallet the gateway has just created has no descriptor yet. Zero, not an
+// error: "nothing is watched" is a normal state at first start.
+func TestActiveRangeEndIsZeroOnAFreshWallet(t *testing.T) {
+	c, srv := newRangeNode(t, `{"result":{"wallet_name":"payments","descriptors":[]}}`)
+	defer srv.Close()
+
+	got, err := c.ActiveRangeEnd(context.Background())
+	if err != nil {
+		t.Fatalf("ActiveRangeEnd: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("ActiveRangeEnd = %d, want 0", got)
+	}
+}
+
+// An unranged descriptor has no range at all. It cannot be the gateway's
+// (Open refuses those), but it can sit in the same wallet, and indexing into
+// a missing field is how a nil panic reaches production.
+func TestActiveRangeEndIgnoresUnrangedDescriptors(t *testing.T) {
+	c, srv := newRangeNode(t, `{"result":{"descriptors":[
+		{"desc":"pkh(tpubA/0/0)#aaa","active":true,"internal":false}
+	]}}`)
+	defer srv.Close()
+
+	got, err := c.ActiveRangeEnd(context.Background())
+	if err != nil {
+		t.Fatalf("ActiveRangeEnd: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("ActiveRangeEnd = %d, want 0", got)
+	}
+}
+
+func newRangeNode(t *testing.T, body string) (*Client, *httptest.Server) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req recorded
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &req)
+		if req.Method != "listdescriptors" {
+			t.Errorf("ActiveRangeEnd called %q, want listdescriptors", req.Method)
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	return New(srv.URL, "u", "p"), srv
+}

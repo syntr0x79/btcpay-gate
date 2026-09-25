@@ -23,6 +23,9 @@ type Node interface {
 	GetDescriptorInfo(ctx context.Context, descriptor string) (rpc.DescriptorInfo, error)
 	ImportRangedDescriptor(ctx context.Context, descriptor string, from, to int) error
 	DeriveAddresses(ctx context.Context, descriptor string, from, to int) ([]string, error)
+	// ActiveRangeEnd is how far the node already watches. Core does not keep
+	// the range it was given — see the comment on cover below.
+	ActiveRangeEnd(ctx context.Context) (int, error)
 }
 
 type Wallet struct {
@@ -70,16 +73,59 @@ func Open(ctx context.Context, node Node, cfg Config) (*Wallet, error) {
 	}
 	checksummed := info.Descriptor
 
-	if err := node.ImportRangedDescriptor(ctx, checksummed, 0, cfg.InitialRange); err != nil {
-		return nil, fmt.Errorf("import descriptor: %w", err)
-	}
-
-	return &Wallet{
+	w := &Wallet{
 		node:       node,
 		descriptor: checksummed,
-		gapEnd:     cfg.InitialRange,
 		step:       cfg.InitialRange,
-	}, nil
+	}
+	if err := w.cover(ctx, cfg.InitialRange); err != nil {
+		return nil, fmt.Errorf("import descriptor: %w", err)
+	}
+	return w, nil
+}
+
+// cover makes sure the node watches at least up to end, and records how far
+// it actually does.
+//
+// Every import starts at 0 and never asks for less than the node already has.
+// That is not caution, it is the only shape core accepts. Measured on 28.0:
+// an active descriptor imported with range [0,50] leaves the wallet watching
+// [0,999] — core widens it to the keypool — and after that
+//
+//	[0,50]      → -8: new range must include current range = [0,999]
+//	[50,100]    → -8, same
+//	[1000,2000] → -8, same
+//	[0,999]     → ok
+//	[0,2000]    → ok
+//
+// Both failures this fixes came from ignoring that. Asking for the initial
+// range again on restart is what put the gateway in a restart loop on the e2e
+// stand; asking for the new stretch alone ([gapEnd, next]) is what made range
+// extension fail every time it was ever attempted — with the shipped
+// ADDRESS_GAP of 1000, from the thousand-and-first invoice onward.
+func (w *Wallet) cover(ctx context.Context, end int) error {
+	have, err := w.node.ActiveRangeEnd(ctx)
+	if err != nil {
+		return fmt.Errorf("read watched range: %w", err)
+	}
+	if have >= end {
+		// The node already covers us. Importing anyway would succeed and
+		// change nothing, which is worse than not doing it: it would read as
+		// if this call were what set the range up.
+		w.gapEnd = have
+		return nil
+	}
+	if err := w.node.ImportRangedDescriptor(ctx, w.descriptor, 0, end); err != nil {
+		return err
+	}
+	// Re-read rather than assume: core may have widened past what we asked
+	// for, and a gapEnd smaller than reality means a pointless import on the
+	// very next invoice.
+	if after, err := w.node.ActiveRangeEnd(ctx); err == nil && after > end {
+		end = after
+	}
+	w.gapEnd = end
+	return nil
 }
 
 // AddressAt derives the address for one index.
@@ -118,10 +164,9 @@ func (w *Wallet) ensureWatched(ctx context.Context, index int) error {
 	for index >= next {
 		next += w.step
 	}
-	if err := w.node.ImportRangedDescriptor(ctx, w.descriptor, w.gapEnd, next); err != nil {
+	if err := w.cover(ctx, next); err != nil {
 		return fmt.Errorf("extend watched range to %d: %w", next, err)
 	}
-	w.gapEnd = next
 	return nil
 }
 

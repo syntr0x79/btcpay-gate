@@ -114,6 +114,51 @@ func (c *Client) GetDescriptorInfo(ctx context.Context, descriptor string) (Desc
 	return out, err
 }
 
+// descriptorEntry is one row of listdescriptors.
+type descriptorEntry struct {
+	Desc     string `json:"desc"`
+	Active   bool   `json:"active"`
+	Internal bool   `json:"internal"`
+	// Range is absent for an unranged descriptor, so this is a pointer: an
+	// empty slice and "no range at all" must not read the same.
+	Range *[]int `json:"range"`
+}
+
+// ActiveRangeEnd reports how far the wallet's active receiving descriptor is
+// already watching, or 0 if it has none.
+//
+// This exists because core does not keep the range it was given. Measured on
+// 28.0: importing an active descriptor with range [0,50] leaves the wallet
+// watching [0,999] — core widens it to the keypool — and from then on every
+// import must COVER that wider range, or it fails with
+//
+//	-8: new range must include current range = [0,999]
+//
+// Sub-ranges are refused outright, whatever their bounds. So the only import
+// core ever accepts is one starting at 0 and ending no earlier than here.
+func (c *Client) ActiveRangeEnd(ctx context.Context) (int, error) {
+	var out struct {
+		Descriptors []descriptorEntry `json:"descriptors"`
+	}
+	if err := c.Call(ctx, &out, "listdescriptors"); err != nil {
+		return 0, err
+	}
+	end := 0
+	for _, d := range out.Descriptors {
+		// Internal is the change descriptor and inactive ones are not
+		// watched: neither is where an invoice gets paid, and counting them
+		// would inflate the range we have to keep covering forever.
+		if !d.Active || d.Internal || d.Range == nil {
+			continue
+		}
+		r := *d.Range
+		if len(r) == 2 && r[1] > end {
+			end = r[1]
+		}
+	}
+	return end, nil
+}
+
 type importRequest struct {
 	Desc      string `json:"desc"`
 	Active    bool   `json:"active"`
