@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syntr0x79/btcpay-gate/internal/health"
 	"github.com/syntr0x79/btcpay-gate/internal/payments"
 )
 
@@ -228,9 +229,78 @@ func TestIDsAreUnique(t *testing.T) {
 	}
 }
 
-func TestHealthz(t *testing.T) {
+// fakeHealth stands in for the chain monitor's view of itself.
+type fakeHealth struct{ report health.Report }
+
+func (f *fakeHealth) Report() health.Report { return f.report }
+
+func healthServer(t *testing.T, r health.Report) *Server {
+	t.Helper()
+	st, err := payments.Open(filepath.Join(t.TempDir(), "api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return New(st, &fakeAddresses{}, Config{Health: &fakeHealth{report: r}},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+func TestHealthzGreenWhenMonitorIsReadingTheChain(t *testing.T) {
+	s := healthServer(t, health.Report{OK: true, WalletLoaded: true, LastSuccess: time.Unix(1_700_000_000, 0)})
+	w := do(t, s, "GET", "/healthz", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200; body %q", w.Code, w.Body.String())
+	}
+}
+
+// The regression. /healthz used to be a constant 200, so a gateway whose poll
+// loop had been dead for six hours still read as healthy from the outside —
+// and docker, which probes this same handler, never restarted it.
+func TestHealthzRedWhenPollLoopIsDead(t *testing.T) {
+	s := healthServer(t, health.Report{OK: false, Reason: "wallet payments is not loaded"})
+	w := do(t, s, "GET", "/healthz", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503; body %q", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "wallet payments is not loaded") {
+		t.Errorf("body %q does not say why it is unhealthy", w.Body.String())
+	}
+}
+
+// A gateway assembled without wiring the monitor in must not inherit the old
+// always-green behaviour: forgetting the wiring has to be visible, and the
+// safe direction to fail is red.
+func TestHealthzRedWhenHealthIsNotWired(t *testing.T) {
 	s, _, _ := newServer(t)
-	if w := do(t, s, "GET", "/healthz", ""); w.Code != http.StatusOK {
-		t.Fatalf("status %d", w.Code)
+	if w := do(t, s, "GET", "/healthz", ""); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d, want 503", w.Code)
+	}
+}
+
+func TestMetricsExposeWalletAndPollAge(t *testing.T) {
+	s := healthServer(t, health.Report{OK: true, WalletLoaded: true, LastSuccess: time.Unix(1_700_000_000, 0)})
+	body := do(t, s, "GET", "/metrics", "").Body.String()
+
+	for _, want := range []string{
+		"paygate_wallet_loaded 1",
+		"paygate_last_poll_timestamp_seconds 1700000000",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// Zero, not absent: an alert written as `paygate_wallet_loaded == 0` has to
+// fire, and a series that disappears matches nothing.
+func TestMetricsReportZeroForMissingWallet(t *testing.T) {
+	s := healthServer(t, health.Report{OK: false, Reason: "wallet not loaded"})
+	body := do(t, s, "GET", "/metrics", "").Body.String()
+
+	if !strings.Contains(body, "paygate_wallet_loaded 0") {
+		t.Errorf("/metrics does not report paygate_wallet_loaded 0:\n%s", body)
+	}
+	if !strings.Contains(body, "paygate_last_poll_timestamp_seconds 0") {
+		t.Errorf("/metrics does not report a zero poll timestamp:\n%s", body)
 	}
 }

@@ -13,8 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/syntr0x79/btcpay-gate/internal/health"
 	"github.com/syntr0x79/btcpay-gate/internal/payments"
 )
+
+// HealthSource is the chain monitor's view of itself. Kept as an interface so
+// the HTTP layer can be tested without a node or a poll loop.
+type HealthSource interface {
+	Report() health.Report
+}
 
 // AddressSource hands out a fresh receiving address. Kept as an interface so
 // the HTTP layer can be tested without a node.
@@ -27,6 +34,7 @@ type Server struct {
 	addresses   AddressSource
 	defaultConf int64
 	defaultTTL  time.Duration
+	health      HealthSource
 	log         *slog.Logger
 	now         func() time.Time
 }
@@ -34,6 +42,11 @@ type Server struct {
 type Config struct {
 	DefaultConfirmations int64
 	DefaultTTL           time.Duration
+	// Health is what /healthz and /metrics answer from. Leaving it nil is
+	// treated as a wiring mistake and reported as unhealthy rather than
+	// defaulted to green: an endpoint that cannot be wrong is the bug this
+	// field was added to fix.
+	Health HealthSource
 }
 
 func New(store *payments.Store, addresses AddressSource, cfg Config, log *slog.Logger) *Server {
@@ -48,6 +61,7 @@ func New(store *payments.Store, addresses AddressSource, cfg Config, log *slog.L
 		addresses:   addresses,
 		defaultConf: cfg.DefaultConfirmations,
 		defaultTTL:  cfg.DefaultTTL,
+		health:      cfg.Health,
 		log:         log,
 		now:         time.Now,
 	}
@@ -57,11 +71,66 @@ func (s *Server) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /invoices", s.createInvoice)
 	mux.HandleFunc("GET /invoices/{id}", s.getInvoice)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok\n"))
-	})
+	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /metrics", s.metrics)
 	return mux
+}
+
+// report is the health state, or a refusal to guess when nothing was wired in.
+func (s *Server) report() health.Report {
+	if s.health == nil {
+		return health.Report{Reason: "health state not wired into the HTTP layer"}
+	}
+	return s.health.Report()
+}
+
+// healthz answers the question the service exists to answer — can it see
+// payments? — rather than "is this process listening?".
+//
+// 503 and not 500: this is the code docker's healthcheck and any load balancer
+// already treat as "take it out of rotation", and taking a gateway that cannot
+// read the chain out of rotation is exactly right. The reason travels in the
+// body so it reaches `docker inspect` and the logs of whatever probed it.
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	r := s.report()
+	if !r.OK {
+		http.Error(w, r.Reason, http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok\n"))
+}
+
+// metrics is a hand-written prometheus exposition of the two numbers worth
+// alerting on.
+//
+// Hand-written for the same reason the RPC client is: pulling client_golang in
+// to print four lines would add more dependency surface to a service that
+// touches money than the code it replaces.
+//
+// Both gauges are always emitted, including as zero. An alert written as
+// `paygate_wallet_loaded == 0` matches nothing if the series simply vanishes,
+// which would reproduce the original failure in a new place.
+func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+	r := s.report()
+
+	loaded := 0
+	if r.WalletLoaded {
+		loaded = 1
+	}
+	var lastPoll int64
+	if !r.LastSuccess.IsZero() {
+		lastPoll = r.LastSuccess.Unix()
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, `# HELP paygate_wallet_loaded Whether bitcoind currently has this gateway's wallet loaded.
+# TYPE paygate_wallet_loaded gauge
+paygate_wallet_loaded %d
+# HELP paygate_last_poll_timestamp_seconds Unix time of the last chain poll that succeeded, 0 if none has.
+# TYPE paygate_last_poll_timestamp_seconds gauge
+paygate_last_poll_timestamp_seconds %d
+`, loaded, lastPoll)
 }
 
 type createRequest struct {

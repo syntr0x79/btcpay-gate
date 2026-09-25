@@ -358,3 +358,48 @@ func TestWindowIsConfigurable(t *testing.T) {
 		t.Fatalf("target_confirmations = %d, want 50", node.confirmations[0])
 	}
 }
+
+// recorder captures what the monitor tells the health state, without pulling
+// the health package into these tests.
+type recorder struct {
+	ok     int
+	failed []error
+}
+
+func (r *recorder) PollSucceeded()       { r.ok++ }
+func (r *recorder) PollFailed(err error) { r.failed = append(r.failed, err) }
+
+// The monitor is the only thing that knows whether the chain is readable, so
+// it is the only thing that can keep /healthz honest. Before this, a dead poll
+// loop was invisible to every probe in the system.
+func TestPollReportsOutcomeToHealth(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	node := &fakeNode{responses: []rpc.SinceBlock{{LastBlock: "block-1"}}}
+
+	rec := &recorder{}
+	m := newMonitor(node, st).WithHealth(rec)
+	mustPoll(t, m, ctx)
+
+	if rec.ok != 1 || len(rec.failed) != 0 {
+		t.Fatalf("after a good poll: ok=%d failed=%v, want ok=1 failed=none", rec.ok, rec.failed)
+	}
+
+	want := errors.New("bitcoind error -18: Requested wallet does not exist or is not loaded")
+	node.err = want
+	if err := m.Poll(ctx); err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(rec.failed) != 1 || !errors.Is(rec.failed[0], want) {
+		t.Fatalf("failed polls reported: %v, want exactly [%v]", rec.failed, want)
+	}
+}
+
+// A monitor built without a health reporter must still poll. Wiring is a
+// deployment concern; correctness of the ledger is not.
+func TestMonitorWorksWithoutHealth(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	node := &fakeNode{responses: []rpc.SinceBlock{{LastBlock: "block-1"}}}
+	mustPoll(t, newMonitor(node, st), ctx)
+}

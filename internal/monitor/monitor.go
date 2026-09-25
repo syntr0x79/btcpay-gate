@@ -18,6 +18,21 @@ type Node interface {
 	ListSinceBlock(ctx context.Context, blockHash string, minConf int) (rpc.SinceBlock, error)
 }
 
+// Reporter is told the outcome of every poll. The monitor is the only thing in
+// the process that learns whether the chain is readable, so it is the only
+// thing that can keep the health endpoint honest.
+type Reporter interface {
+	PollSucceeded()
+	PollFailed(err error)
+}
+
+// nopReporter keeps Poll free of nil checks. A monitor without a reporter is a
+// valid monitor — the ledger does not depend on anyone watching.
+type nopReporter struct{}
+
+func (nopReporter) PollSucceeded()       {}
+func (nopReporter) PollFailed(err error) {}
+
 type Monitor struct {
 	node     Node
 	store    *payments.Store
@@ -25,6 +40,7 @@ type Monitor struct {
 	window   int
 	log      *slog.Logger
 	now      func() time.Time
+	health   Reporter
 }
 
 // DefaultWindow is how far behind the tip the cursor is kept, in blocks.
@@ -49,7 +65,17 @@ func New(node Node, store *payments.Store, interval time.Duration, log *slog.Log
 		window:   DefaultWindow,
 		log:      log,
 		now:      time.Now,
+		health:   nopReporter{},
 	}
+}
+
+// WithHealth routes poll outcomes to the shared health state read by /healthz
+// and /metrics.
+func (m *Monitor) WithHealth(r Reporter) *Monitor {
+	if r != nil {
+		m.health = r
+	}
+	return m
 }
 
 // WithWindow overrides how far the cursor lags the tip. Raise it above
@@ -99,7 +125,20 @@ func (m *Monitor) Run(ctx context.Context) error {
 
 // Poll performs one catch-up pass. Exported so tests and the regtest suite can
 // drive it deterministically instead of waiting for a ticker.
+//
+// Every outcome is reported to the health state, including the ones Run only
+// logs: a log line is what the last outage produced, and nobody read it.
 func (m *Monitor) Poll(ctx context.Context) error {
+	err := m.poll(ctx)
+	if err != nil {
+		m.health.PollFailed(err)
+		return err
+	}
+	m.health.PollSucceeded()
+	return nil
+}
+
+func (m *Monitor) poll(ctx context.Context) error {
 	cursor, err := m.store.Cursor(ctx)
 	if err != nil {
 		return err

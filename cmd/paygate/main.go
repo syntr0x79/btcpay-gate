@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/syntr0x79/btcpay-gate/internal/api"
+	"github.com/syntr0x79/btcpay-gate/internal/health"
 	"github.com/syntr0x79/btcpay-gate/internal/monitor"
 	"github.com/syntr0x79/btcpay-gate/internal/payments"
 	"github.com/syntr0x79/btcpay-gate/internal/rpc"
@@ -61,13 +62,19 @@ func run(log *slog.Logger) error {
 	}
 	defer store.Close()
 
-	mon := monitor.New(node, store, cfg.pollInterval, log)
+	// One health state, written by the monitor and read by the HTTP layer, so
+	// that /healthz and /metrics answer from what the poll loop actually
+	// experienced rather than from the fact that a listener is bound.
+	hl := health.New(cfg.maxPollAge)
+
+	mon := monitor.New(node, store, cfg.pollInterval, log).WithHealth(hl)
 	sender := newSender(store, cfg, log)
 	server := &http.Server{
 		Addr: cfg.listen,
 		Handler: api.New(store, w, api.Config{
 			DefaultConfirmations: cfg.requiredConf,
 			DefaultTTL:           cfg.invoiceTTL,
+			Health:               hl,
 		}, log).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -118,6 +125,7 @@ type config struct {
 	webhookURL    string
 	webhookSecret string
 	pollInterval  time.Duration
+	maxPollAge    time.Duration
 	invoiceTTL    time.Duration
 	requiredConf  int64
 	addressGap    int
@@ -135,6 +143,7 @@ func loadConfig() (config, error) {
 		webhookURL:    env("WEBHOOK_URL", ""),
 		webhookSecret: env("WEBHOOK_SECRET", ""),
 		pollInterval:  duration("POLL_INTERVAL", 10*time.Second),
+		maxPollAge:    duration("HEALTH_MAX_POLL_AGE", health.DefaultMaxPollAge),
 		invoiceTTL:    duration("INVOICE_TTL", 30*time.Minute),
 		requiredConf:  int64(number("REQUIRED_CONFIRMATIONS", 2)),
 		addressGap:    number("ADDRESS_GAP", 1000),

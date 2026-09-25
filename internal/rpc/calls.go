@@ -43,18 +43,59 @@ func (c *Client) GetBestBlockHash(ctx context.Context) (string, error) {
 func (c *Client) CreateWatchOnlyWallet(ctx context.Context, name string) error {
 	// name, disable_private_keys, blank, passphrase, avoid_reuse, descriptors, load_on_startup
 	err := c.Call(ctx, nil, "createwallet", name, true, true, "", false, true, true)
-	if err != nil && isAlreadyExists(err) {
-		return c.Call(ctx, nil, "loadwallet", name)
+	if err == nil || !isAlreadyExists(err) {
+		return err
+	}
+
+	// The wallet is already on disk, from an earlier run of this gateway.
+	//
+	// load_on_startup is repeated here and not only on createwallet: a wallet
+	// that exists says nothing about whether core still has it in the startup
+	// list. On shop-pl it did not, so every restart of the node left the node
+	// walletless and the gateway polling into the void until someone restarted
+	// the gateway. Setting it here is what makes the node recover on its own.
+	err = c.Call(ctx, nil, "loadwallet", name, true)
+	if isAlreadyLoaded(err) {
+		// Which is exactly what the startup list above produces: the node
+		// loaded the wallet before we asked. Treating -35 as fatal is how
+		// adding -wallet= to the node put this process in a restart loop on
+		// 2026-09-22 — the two mechanisms were mutually exclusive, and they
+		// should not have been.
+		return nil
 	}
 	return err
 }
 
 func isAlreadyExists(err error) bool {
-	var re *rpcError
+	var re *Error
 	if errors.As(err, &re) {
 		// -4: wallet already exists. Message matching as a fallback, because
 		// the code has moved between core releases.
 		return re.Code == -4 || strings.Contains(strings.ToLower(re.Message), "already exists")
+	}
+	return false
+}
+
+// isAlreadyLoaded reports core's -35, RPC_WALLET_ALREADY_LOADED. Narrow by
+// design: -4 from loadwallet means the wallet is on disk but unopenable (a
+// pruned node past the wallet's last sync point, say), and that must still
+// stop the gateway rather than be started around.
+func isAlreadyLoaded(err error) bool {
+	var re *Error
+	if errors.As(err, &re) {
+		return re.Code == -35 || strings.Contains(strings.ToLower(re.Message), "already loaded")
+	}
+	return false
+}
+
+// IsWalletNotLoaded reports core's -18, RPC_WALLET_NOT_FOUND: the node has no
+// wallet by that name open, so every wallet-scoped call will fail the same way
+// until something loads it. Distinguishing this from a timeout is what lets
+// the health state say "the wallet is gone" instead of "the node is slow".
+func IsWalletNotLoaded(err error) bool {
+	var re *Error
+	if errors.As(err, &re) {
+		return re.Code == -18
 	}
 	return false
 }
@@ -83,8 +124,8 @@ type importRequest struct {
 }
 
 type ImportResult struct {
-	Success bool      `json:"success"`
-	Error   *rpcError `json:"error"`
+	Success bool   `json:"success"`
+	Error   *Error `json:"error"`
 }
 
 // ImportRangedDescriptor registers a ranged descriptor as the wallet's active

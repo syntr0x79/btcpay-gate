@@ -52,20 +52,19 @@ type request struct {
 	Params  []any  `json:"params"`
 }
 
-type rpcError struct {
+// Error is a JSON-RPC error from bitcoind. Exported with its code so callers
+// can distinguish "wallet already exists" from "node is unreachable" without
+// matching on message text — core moves those strings between releases.
+type Error struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
 }
 
-func (e *rpcError) Error() string { return fmt.Sprintf("bitcoind error %d: %s", e.Code, e.Message) }
-
-// Code exposes core's error code so callers can distinguish "wallet already
-// exists" from "node is unreachable" without matching on message text.
-func (e *rpcError) ErrorCode() int { return e.Code }
+func (e *Error) Error() string { return fmt.Sprintf("bitcoind error %d: %s", e.Code, e.Message) }
 
 type response struct {
 	Result json.RawMessage `json:"result"`
-	Error  *rpcError       `json:"error"`
+	Error  *Error          `json:"error"`
 }
 
 func (c *Client) endpoint() string {
